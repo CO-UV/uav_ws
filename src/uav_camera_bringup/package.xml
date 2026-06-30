@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>uav_camera_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch and configuration files for UAV camera streaming.</description>
+  <maintainer email="co-uv@example.com">Co-UV</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>v4l2_camera</exec_depend>
+  <exec_depend>image_transport</exec_depend>
+  <exec_depend>compressed_image_transport</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>realsense2_camera_msgs</exec_depend>
+  <exec_depend>uav_camera_streamer</exec_depend>
+  <exec_depend>uav_camera_status</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

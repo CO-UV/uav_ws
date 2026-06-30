@@ -1,0 +1,17 @@
+[Unit]
+Description=Co-UV UAV ROS 2 camera streaming
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/uav_ws
+Environment=ROS_DOMAIN_ID=23
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/ubuntu/uav_ws/install/setup.bash && ros2 launch uav_camera_bringup uav_camera_system.launch.py network_interface:=wlan0'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

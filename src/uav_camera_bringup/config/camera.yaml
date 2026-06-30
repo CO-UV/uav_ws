@@ -1,0 +1,7 @@
+uav_usb_camera:
+  ros__parameters:
+    video_device: /dev/video4
+    image_width: 640
+    image_height: 480
+    fps: 30
+    camera_frame_id: uav_camera_color_optical_frame

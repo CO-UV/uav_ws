@@ -1,0 +1,12 @@
+camera_streams:
+  reliability: best_effort
+  history: keep_last
+  depth: 1
+  durability: volatile
+
+status_streams:
+  reliability: reliable
+  history: keep_last
+  depth: 10
+  durability: volatile
+
