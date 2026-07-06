@@ -21,13 +21,13 @@ src/
 
 ## Main Topics
 
-RealSense camera:
+RealSense camera (default system launch, bandwidth-optimized compressed transport):
 
 ```text
-/uav/camera/color/image_raw
-/uav/camera/color/camera_info
-/uav/camera/depth/image_rect_raw
-/uav/camera/depth/camera_info
+/uav/camera/color/image_raw/compressed   sensor_msgs/CompressedImage  (jpeg, ~15 fps)
+/uav/camera/color/camera_info            sensor_msgs/CameraInfo
+/uav/camera/depth/image_rect_raw/compressed  sensor_msgs/CompressedImage  (png, ~5 fps requested)
+/uav/camera/depth/camera_info            sensor_msgs/CameraInfo
 ```
 
 Status:
@@ -41,11 +41,12 @@ Status:
 ```
 
 The default system launch uses V4L2 devices directly for stable Raspberry Pi bringup.
-The `realsense2_camera` RGB-D launch is kept as an optional path for aligned depth and point cloud tests.
+The `realsense2_camera` RGB-D launch is kept as an optional path for aligned depth and point cloud tests
+(and still publishes uncompressed `image_raw` / `image_rect_raw`).
 
 ```text
-/dev/video4  color, YUYV -> rgb8
-/dev/video0  depth, Z16  -> 16UC1
+/dev/video4  color, YUYV (hardware has no MJPG mode; JPEG is software-encoded, see below)
+/dev/video0  depth, Z16  -> 16UC1 (PNG-compressed for transport, see below)
 /uav/camera/aligned_depth_to_color/image_raw
 /uav/camera/depth/color/points
 ```
@@ -110,20 +111,79 @@ Use the same `ROS_DOMAIN_ID` on the Raspberry Pi and main PC.
 
 ```bash
 ros2 topic list
-ros2 topic hz /uav/camera/color/image_raw
-ros2 topic bw /uav/camera/color/image_raw
-ros2 topic hz /uav/camera/depth/image_rect_raw
-ros2 topic bw /uav/camera/depth/image_rect_raw
+ros2 topic hz /uav/camera/color/image_raw/compressed
+ros2 topic bw /uav/camera/color/image_raw/compressed
+ros2 topic hz /uav/camera/depth/image_rect_raw/compressed
+ros2 topic bw /uav/camera/depth/image_rect_raw/compressed
 ros2 topic echo /uav/heartbeat
 ros2 topic echo /uav/camera/color/status
 ros2 topic echo /uav/camera/depth/status
 ```
 
-View the image:
+If `ros2 topic list` shows nothing even though the Raspberry Pi is publishing, a stale
+`ros2 daemon` on the main PC is the usual cause (it caches the discovery graph from
+whatever `ROS_DOMAIN_ID`/`ROS_DISCOVERY_SERVER` was set when it first started). Restart it:
 
 ```bash
-rqt_image_view /uav/camera/color/image_raw
+ros2 daemon stop
+ros2 daemon start
 ```
+
+View the image (rqt can decode `sensor_msgs/CompressedImage` directly):
+
+```bash
+rqt_image_view /uav/camera/color/image_raw/compressed
+```
+
+## Receiving Topics on the Main PC
+
+Both image topics are `sensor_msgs/CompressedImage`, not raw `Image` — decode them with
+OpenCV (or an `image_transport` "compressed" subscriber, since the `format` field follows
+the standard `cv_bridge` convention `"<encoding>; <codec> compressed"`).
+
+**Color** — `/uav/camera/color/image_raw/compressed`, `format: "bgr8; jpeg compressed"`:
+
+```python
+import cv2
+import numpy as np
+
+def on_color(msg):  # msg: sensor_msgs.msg.CompressedImage
+    bgr = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
+```
+
+**Depth** — `/uav/camera/depth/image_rect_raw/compressed`, `format: "16UC1; png compressed"`:
+
+```python
+def on_depth(msg):  # msg: sensor_msgs.msg.CompressedImage
+    depth_mm = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_UNCHANGED)
+    # depth_mm is a uint16 array, same millimeter units as the original 16UC1 image
+```
+
+**CameraInfo** — `/uav/camera/color/camera_info`, `/uav/camera/depth/camera_info`:
+standard `sensor_msgs/CameraInfo`, published once per frame alongside the matching image.
+Note the checked-in `camera_info.yaml` is a placeholder (see [CameraInfo](#camerainfo) below).
+
+**Status / heartbeat topics** — `std_msgs/String` carrying a JSON payload (`json.loads(msg.data)`):
+
+```text
+/uav/camera/color/status, /uav/camera/depth/status
+  {ok, image_topic, last_frame_age_sec, last_frame_stamp_sec, camera_info_ok,
+   last_camera_info_age_sec, camera_info_count, frame_count, estimated_fps,
+   width, height, encoding, camera_info_width, camera_info_height, camera_frame_id}
+
+/uav/heartbeat
+  {vehicle_id, hostname, sequence, stamp_unix_sec, uptime_sec, ok}
+
+/uav/network/status
+  {stamp_unix_sec, hostname, interface, ip_address, ping_host, ping_ok}
+
+/uav/system/status
+  {stamp_unix_sec, cpu_percent, load_average, memory, cpu_temperature_c}
+```
+
+`width`/`height`/`encoding` in the camera status messages are `null` for the compressed
+topics (there's no raw frame to measure) — use `estimated_fps` and `ok` for health checks
+instead.
 
 ## RealSense D435if via V4L2
 
@@ -314,3 +374,31 @@ Main PC receives:
   heartbeat/status messages
   measurable topic bandwidth and latency
 ```
+
+## Stage 3: Compressed Transport for Bandwidth
+
+The default system launch now publishes compressed images instead of raw `Image` messages
+to cut Wi-Fi bandwidth, with color and depth FPS tuned independently
+(`color_fps` default 15, `depth_fps` default 5).
+
+- **Color**: the RealSense color sensor's V4L2 driver only exposes `YUYV` — it has no
+  hardware MJPG mode. `v4l2_mjpeg_node` captures raw YUYV and JPEG-encodes it in software
+  with OpenCV (`jpeg_quality` parameter, default 80) before publishing as
+  `sensor_msgs/CompressedImage`.
+- **Depth**: `v4l2_depth_node` gained `publish_raw` / `publish_compressed` parameters. The
+  default system/rgbd launches publish only the PNG-compressed 16UC1 stream
+  (`png_compression_level` parameter) to save bandwidth; raw `Image` publishing is still
+  available by setting `publish_raw:=true`.
+- Both `CompressedImage.format` strings follow the `cv_bridge` convention
+  (`"<encoding>; <codec> compressed"`) so standard `image_transport` "compressed"
+  subscribers can decode them, not just custom OpenCV code. See
+  [Receiving Topics on the Main PC](#receiving-topics-on-the-main-pc).
+- Both V4L2 nodes now drain `v4l2-ctl`'s stderr continuously on a background thread.
+  `v4l2-ctl` prints live fps/dropped-buffer stats to stderr while streaming; without
+  draining it, the pipe buffer fills up and silently kills the stream after roughly
+  10-15 seconds.
+
+**Known issue**: the depth compressed topic is stable (no crashes) but its measured
+publish rate is only ~1.3 Hz against the requested `depth_fps:=5.0` — likely PNG encode
+or raw-frame-read overhead on the Pi's CPU rather than the stderr fix above. Not yet
+root-caused.

@@ -21,6 +21,7 @@ setup(
             "camera_health_node = uav_camera_streamer.camera_health_node:main",
             "save_image_once = uav_camera_streamer.save_image_once:main",
             "v4l2_depth_node = uav_camera_streamer.v4l2_depth_node:main",
+            "v4l2_mjpeg_node = uav_camera_streamer.v4l2_mjpeg_node:main",
         ],
     },
 )

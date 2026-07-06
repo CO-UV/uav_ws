@@ -17,13 +17,15 @@ def generate_launch_description():
             DeclareLaunchArgument("depth_video_device", default_value="/dev/video0"),
             DeclareLaunchArgument("image_width", default_value="640"),
             DeclareLaunchArgument("image_height", default_value="480"),
-            DeclareLaunchArgument("fps", default_value="30.0"),
+            DeclareLaunchArgument("color_fps", default_value="15.0"),
+            DeclareLaunchArgument("depth_fps", default_value="5.0"),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(color_launch),
                 launch_arguments={
                     "video_device": LaunchConfiguration("color_video_device"),
                     "image_width": LaunchConfiguration("image_width"),
                     "image_height": LaunchConfiguration("image_height"),
+                    "fps": LaunchConfiguration("color_fps"),
                 }.items(),
             ),
             Node(
@@ -36,7 +38,10 @@ def generate_launch_description():
                         "video_device": LaunchConfiguration("depth_video_device"),
                         "image_width": LaunchConfiguration("image_width"),
                         "image_height": LaunchConfiguration("image_height"),
-                        "fps": LaunchConfiguration("fps"),
+                        "fps": LaunchConfiguration("depth_fps"),
+                        "publish_raw": False,
+                        "publish_compressed": True,
+                        "png_compression_level": 1,
                     }
                 ],
             ),

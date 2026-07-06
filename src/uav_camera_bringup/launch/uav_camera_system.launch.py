@@ -17,7 +17,8 @@ def generate_launch_description():
             DeclareLaunchArgument("depth_video_device", default_value="/dev/video0"),
             DeclareLaunchArgument("image_width", default_value="640"),
             DeclareLaunchArgument("image_height", default_value="480"),
-            DeclareLaunchArgument("fps", default_value="30.0"),
+            DeclareLaunchArgument("color_fps", default_value="15.0"),
+            DeclareLaunchArgument("depth_fps", default_value="5.0"),
             DeclareLaunchArgument("network_interface", default_value="wlan0"),
             DeclareLaunchArgument("network_ping_host", default_value="8.8.8.8"),
             IncludeLaunchDescription(
@@ -27,7 +28,8 @@ def generate_launch_description():
                     "depth_video_device": LaunchConfiguration("depth_video_device"),
                     "image_width": LaunchConfiguration("image_width"),
                     "image_height": LaunchConfiguration("image_height"),
-                    "fps": LaunchConfiguration("fps"),
+                    "color_fps": LaunchConfiguration("color_fps"),
+                    "depth_fps": LaunchConfiguration("depth_fps"),
                 }.items(),
             ),
             Node(
@@ -37,10 +39,11 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
-                        "image_topic": "/uav/camera/color/image_raw",
+                        "image_topic": "/uav/camera/color/image_raw/compressed",
                         "camera_info_topic": "/uav/camera/color/camera_info",
                         "status_topic": "/uav/camera/color/status",
                         "timeout_sec": 2.0,
+                        "compressed": True,
                     }
                 ],
             ),
@@ -51,10 +54,11 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
-                        "image_topic": "/uav/camera/depth/image_rect_raw",
+                        "image_topic": "/uav/camera/depth/image_rect_raw/compressed",
                         "camera_info_topic": "/uav/camera/depth/camera_info",
                         "status_topic": "/uav/camera/depth/status",
                         "timeout_sec": 2.0,
+                        "compressed": True,
                     }
                 ],
             ),

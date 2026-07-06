@@ -7,69 +7,55 @@ import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+from sensor_msgs.msg import CameraInfo, CompressedImage
 
 
-class V4L2DepthNode(Node):
+class V4L2MjpegNode(Node):
     def __init__(self):
-        super().__init__("v4l2_depth_node")
+        super().__init__("v4l2_mjpeg_node")
 
-        self.declare_parameter("video_device", "/dev/video0")
+        self.declare_parameter("video_device", "/dev/video4")
         self.declare_parameter("image_width", 640)
         self.declare_parameter("image_height", 480)
-        self.declare_parameter("fps", 30.0)
-        self.declare_parameter("frame_id", "uav_realsense_depth_optical_frame")
-        self.declare_parameter("image_topic", "/uav/camera/depth/image_rect_raw")
+        self.declare_parameter("fps", 15.0)
+        self.declare_parameter("frame_id", "uav_realsense_color_optical_frame")
         self.declare_parameter(
-            "compressed_image_topic", "/uav/camera/depth/image_rect_raw/compressed"
+            "image_topic", "/uav/camera/color/image_raw/compressed"
         )
-        self.declare_parameter("camera_info_topic", "/uav/camera/depth/camera_info")
-        self.declare_parameter("publish_raw", True)
-        self.declare_parameter("publish_compressed", False)
-        self.declare_parameter("png_compression_level", 1)
+        self.declare_parameter("camera_info_topic", "/uav/camera/color/camera_info")
+        self.declare_parameter("jpeg_quality", 80)
 
         self.video_device = self.get_parameter("video_device").value
         self.width = int(self.get_parameter("image_width").value)
         self.height = int(self.get_parameter("image_height").value)
         self.fps = float(self.get_parameter("fps").value)
         self.frame_id = self.get_parameter("frame_id").value
-        self.publish_raw = bool(self.get_parameter("publish_raw").value)
-        self.publish_compressed = bool(self.get_parameter("publish_compressed").value)
-        self.png_compression_level = int(self.get_parameter("png_compression_level").value)
+        self.jpeg_quality = int(self.get_parameter("jpeg_quality").value)
 
-        self.image_pub = None
-        if self.publish_raw:
-            self.image_pub = self.create_publisher(
-                Image, self.get_parameter("image_topic").value, 10
-            )
-        self.compressed_image_pub = None
-        if self.publish_compressed:
-            self.compressed_image_pub = self.create_publisher(
-                CompressedImage,
-                self.get_parameter("compressed_image_topic").value,
-                10,
-            )
+        self.image_pub = self.create_publisher(
+            CompressedImage, self.get_parameter("image_topic").value, 10
+        )
         self.info_pub = self.create_publisher(
             CameraInfo, self.get_parameter("camera_info_topic").value, 10
         )
 
+        # RealSense color sensor only exposes YUYV over V4L2 (no hardware MJPG),
+        # so JPEG compression is done in software from the raw YUYV frame.
         self.frame_size = self.width * self.height * 2
         self.stream = self._start_stream()
 
-        period = 1.0 / self.fps if self.fps > 0 else 1.0 / 30.0
+        period = 1.0 / self.fps if self.fps > 0 else 1.0 / 15.0
         self.timer = self.create_timer(period, self.publish_frame)
         self.get_logger().info(
-            f"Publishing Z16 depth from {self.video_device} as 16UC1 "
-            f"{self.width}x{self.height}@{self.fps:g} "
-            f"raw={self.publish_raw} compressed={self.publish_compressed}"
+            f"Publishing JPEG (software-encoded from YUYV) from {self.video_device} "
+            f"as CompressedImage {self.width}x{self.height}@{self.fps:g}"
         )
 
     def _start_stream(self):
-        # RealSense Z16 is a four-character V4L2 code: "Z16 " with a trailing space.
         command = [
             "v4l2-ctl",
             f"--device={self.video_device}",
-            f"--set-fmt-video=width={self.width},height={self.height},pixelformat=Z16 ",
+            f"--set-fmt-video=width={self.width},height={self.height},pixelformat=YUYV",
             f"--set-parm={int(self.fps)}",
             "--stream-mmap",
             "--stream-to=-",
@@ -94,7 +80,7 @@ class V4L2DepthNode(Node):
         time.sleep(0.1)
         if stream.poll() is not None:
             raise RuntimeError(
-                f"v4l2-ctl failed to start depth stream: {self._read_stream_error()}"
+                f"v4l2-ctl failed to start color stream: {self._read_stream_error()}"
             )
 
         return stream
@@ -102,48 +88,35 @@ class V4L2DepthNode(Node):
     def publish_frame(self):
         if self.stream.poll() is not None:
             self.get_logger().error(
-                f"v4l2-ctl depth stream stopped: {self._read_stream_error()}"
+                f"v4l2-ctl color stream stopped: {self._read_stream_error()}"
             )
             self.timer.cancel()
             return
 
         frame = self._read_exact_frame()
         if len(frame) != self.frame_size:
-            self.get_logger().warning("Failed to read depth frame", throttle_duration_sec=2.0)
+            self.get_logger().warning("Failed to read color frame", throttle_duration_sec=2.0)
+            return
+
+        yuyv = np.frombuffer(frame, dtype=np.uint8).reshape(self.height, self.width, 2)
+        bgr = cv2.cvtColor(yuyv, cv2.COLOR_YUV2BGR_YUYV)
+        ok, encoded = cv2.imencode(
+            ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+        )
+        if not ok:
+            self.get_logger().warning(
+                "Failed to encode color frame as JPEG", throttle_duration_sec=2.0
+            )
             return
 
         stamp = self.get_clock().now().to_msg()
 
-        image = Image()
+        image = CompressedImage()
         image.header.stamp = stamp
         image.header.frame_id = self.frame_id
-        image.height = self.height
-        image.width = self.width
-        image.encoding = "16UC1"
-        image.is_bigendian = 0
-        image.step = self.width * 2
-        image.data = frame
-        if self.image_pub is not None:
-            self.image_pub.publish(image)
-
-        if self.compressed_image_pub is not None:
-            depth = np.frombuffer(frame, dtype=np.uint16).reshape(self.height, self.width)
-            ok, encoded = cv2.imencode(
-                ".png",
-                depth,
-                [cv2.IMWRITE_PNG_COMPRESSION, self.png_compression_level],
-            )
-            if ok:
-                compressed = CompressedImage()
-                compressed.header = image.header
-                compressed.format = "16UC1; png compressed"
-                compressed.data = encoded.tobytes()
-                self.compressed_image_pub.publish(compressed)
-            else:
-                self.get_logger().warning(
-                    "Failed to encode depth frame as PNG",
-                    throttle_duration_sec=2.0,
-                )
+        image.format = "bgr8; jpeg compressed"
+        image.data = encoded.tobytes()
+        self.image_pub.publish(image)
 
         info = CameraInfo()
         info.header = image.header
@@ -191,7 +164,7 @@ def main(args=None):
     rclpy.init(args=args)
     node = None
     try:
-        node = V4L2DepthNode()
+        node = V4L2MjpegNode()
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass

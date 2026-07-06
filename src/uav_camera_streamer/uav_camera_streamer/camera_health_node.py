@@ -4,7 +4,7 @@ import time
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import String
 
 
@@ -17,12 +17,14 @@ class CameraHealthNode(Node):
         self.declare_parameter("status_topic", "/uav/camera/status")
         self.declare_parameter("timeout_sec", 2.0)
         self.declare_parameter("publish_rate_hz", 1.0)
+        self.declare_parameter("compressed", False)
 
         self.image_topic = self.get_parameter("image_topic").value
         self.camera_info_topic = self.get_parameter("camera_info_topic").value
         status_topic = self.get_parameter("status_topic").value
         self.timeout_sec = float(self.get_parameter("timeout_sec").value)
         publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
+        self.compressed = bool(self.get_parameter("compressed").value)
 
         self.last_frame_time = None
         self.last_frame_stamp = None
@@ -33,7 +35,8 @@ class CameraHealthNode(Node):
         self.last_report_time = time.monotonic()
         self.last_report_count = 0
 
-        self.create_subscription(Image, self.image_topic, self._on_image, 10)
+        image_msg_type = CompressedImage if self.compressed else Image
+        self.create_subscription(image_msg_type, self.image_topic, self._on_image, 10)
         self.create_subscription(CameraInfo, self.camera_info_topic, self._on_camera_info, 10)
         self.publisher = self.create_publisher(String, status_topic, 10)
         self.create_timer(1.0 / publish_rate_hz, self._publish_status)
@@ -45,9 +48,14 @@ class CameraHealthNode(Node):
         self.last_frame_time = time.monotonic()
         self.last_frame_stamp = self._stamp_to_float(msg.header.stamp)
         self.frame_count += 1
-        self.last_width = msg.width
-        self.last_height = msg.height
-        self.last_encoding = msg.encoding
+        if self.compressed:
+            self.last_width = None
+            self.last_height = None
+            self.last_encoding = msg.format
+        else:
+            self.last_width = msg.width
+            self.last_height = msg.height
+            self.last_encoding = msg.encoding
 
     def _on_camera_info(self, msg):
         self.last_camera_info_time = time.monotonic()
