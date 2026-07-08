@@ -1,13 +1,13 @@
-import subprocess
-import threading
 import time
 
 import cv2
 import numpy as np
 import rclpy
+from linuxpy.video.device import Device, V4L2Error, VideoCapture
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+from std_msgs.msg import Header
 
 
 class V4L2DepthNode(Node):
@@ -54,7 +54,7 @@ class V4L2DepthNode(Node):
         )
 
         self.frame_size = self.width * self.height * 2
-        self.stream = self._start_stream()
+        self.device, self.capture, self._frames = self._start_stream()
 
         period = 1.0 / self.fps if self.fps > 0 else 1.0 / 30.0
         self.timer = self.create_timer(period, self.publish_frame)
@@ -65,65 +65,62 @@ class V4L2DepthNode(Node):
         )
 
     def _start_stream(self):
-        # RealSense Z16 is a four-character V4L2 code: "Z16 " with a trailing space.
-        command = [
-            "v4l2-ctl",
-            f"--device={self.video_device}",
-            f"--set-fmt-video=width={self.width},height={self.height},pixelformat=Z16 ",
-            f"--set-parm={int(self.fps)}",
-            "--stream-mmap",
-            "--stream-to=-",
-        ]
+        # Captured via V4L2 mmap streaming (linuxpy) instead of shelling out to
+        # v4l2-ctl and parsing a raw stdout pipe by hand. Z16 has no in-stream frame
+        # boundary markers (unlike MJPEG's SOI/EOI), so a hand-rolled fixed-size pipe
+        # read that ever desyncs from the true frame boundary (one dropped/short read
+        # at stream start or under buffer pressure) silently corrupts every frame
+        # afterward: adjacent pixels' high/low bytes get spliced together, producing
+        # a permanent, stable-looking contour/terracing pattern rather than an
+        # obvious glitch. VIDIOC_DQBUF guarantees each dequeued buffer is exactly one
+        # full frame, so this desync class can't happen here regardless of timing.
         try:
-            stream = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError("v4l2-ctl is required. Install v4l-utils.") from exc
-
-        self._stderr_tail = b""
-        self._stderr_lock = threading.Lock()
-        self._stderr_thread = threading.Thread(
-            target=self._drain_stderr, args=(stream,), daemon=True
-        )
-        self._stderr_thread.start()
-
-        time.sleep(0.1)
-        if stream.poll() is not None:
+            device = Device(self.video_device)
+            device.open()
+            capture = VideoCapture(device)
+            capture.set_format(self.width, self.height, "Z16 ")
+            if self.fps > 0:
+                try:
+                    capture.set_fps(int(self.fps))
+                except (OSError, V4L2Error):
+                    pass  # device may not support this exact interval; keep its default
+            capture.open()  # allocates/mmaps buffers and starts streaming
+        except (OSError, V4L2Error) as exc:
             raise RuntimeError(
-                f"v4l2-ctl failed to start depth stream: {self._read_stream_error()}"
-            )
+                f"Failed to open depth device {self.video_device}: {exc}"
+            ) from exc
 
-        return stream
+        return device, capture, iter(capture)
 
     def publish_frame(self):
-        if self.stream.poll() is not None:
-            self.get_logger().error(
-                f"v4l2-ctl depth stream stopped: {self._read_stream_error()}"
-            )
+        try:
+            frame = bytes(next(self._frames))
+        except (StopIteration, OSError, V4L2Error) as exc:
+            self.get_logger().error(f"Depth capture stream stopped: {exc}")
             self.timer.cancel()
             return
 
-        frame = self._read_exact_frame()
         if len(frame) != self.frame_size:
             self.get_logger().warning("Failed to read depth frame", throttle_duration_sec=2.0)
             return
 
-        stamp = self.get_clock().now().to_msg()
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = self.frame_id
 
-        image = Image()
-        image.header.stamp = stamp
-        image.header.frame_id = self.frame_id
-        image.height = self.height
-        image.width = self.width
-        image.encoding = "16UC1"
-        image.is_bigendian = 0
-        image.step = self.width * 2
-        image.data = frame
+        # Building a full Image message (with `data` set to the 600KB+ raw frame)
+        # costs ~0.5s on this Pi even when it's never published — rclpy's array-field
+        # setter is that slow for a buffer this size. Only pay for it when actually
+        # publishing raw, instead of doing it unconditionally every frame.
         if self.image_pub is not None:
+            image = Image()
+            image.header = header
+            image.height = self.height
+            image.width = self.width
+            image.encoding = "16UC1"
+            image.is_bigendian = 0
+            image.step = self.width * 2
+            image.data = frame
             self.image_pub.publish(image)
 
         if self.compressed_image_pub is not None:
@@ -135,7 +132,7 @@ class V4L2DepthNode(Node):
             )
             if ok:
                 compressed = CompressedImage()
-                compressed.header = image.header
+                compressed.header = header
                 compressed.format = "16UC1; png compressed"
                 compressed.data = encoded.tobytes()
                 self.compressed_image_pub.publish(compressed)
@@ -146,44 +143,16 @@ class V4L2DepthNode(Node):
                 )
 
         info = CameraInfo()
-        info.header = image.header
+        info.header = header
         info.height = self.height
         info.width = self.width
         self.info_pub.publish(info)
 
-    def _read_exact_frame(self):
-        chunks = []
-        remaining = self.frame_size
-        while remaining > 0:
-            chunk = self.stream.stdout.read(remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
-    def _drain_stderr(self, stream):
-        while True:
-            chunk = stream.stderr.read(4096)
-            if not chunk:
-                return
-            with self._stderr_lock:
-                self._stderr_tail = (self._stderr_tail + chunk)[-4096:]
-
-    def _read_stream_error(self):
-        with self._stderr_lock:
-            tail = self._stderr_tail
-        if not tail:
-            return "no error output"
-        return tail.decode(errors="replace").strip()
-
     def destroy_node(self):
-        if hasattr(self, "stream") and self.stream.poll() is None:
-            self.stream.terminate()
-            try:
-                self.stream.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                self.stream.kill()
+        if hasattr(self, "capture"):
+            self.capture.close()
+        if hasattr(self, "device"):
+            self.device.close()
         super().destroy_node()
 
 

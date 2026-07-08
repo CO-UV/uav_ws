@@ -1,9 +1,6 @@
-import subprocess
-import threading
 import time
 
 import cv2
-import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -39,67 +36,41 @@ class V4L2MjpegNode(Node):
             CameraInfo, self.get_parameter("camera_info_topic").value, 10
         )
 
-        # RealSense color sensor only exposes YUYV over V4L2 (no hardware MJPG),
-        # so JPEG compression is done in software from the raw YUYV frame.
-        self.frame_size = self.width * self.height * 2
-        self.stream = self._start_stream()
+        # RealSense color sensor only exposes YUYV over V4L2 (no hardware MJPG).
+        # Capturing via cv2.VideoCapture (rather than shelling out to v4l2-ctl and
+        # parsing a raw byte pipe by hand) lets OpenCV/V4L2 handle frame
+        # synchronization — a hand-rolled fixed-size pipe read desyncs from the
+        # true frame boundary whenever a buffer is dropped, which silently
+        # corrupts every frame afterward (looks like scrambled green/magenta
+        # bands, not just a wrong color channel order).
+        self.capture = self._open_capture()
 
         period = 1.0 / self.fps if self.fps > 0 else 1.0 / 15.0
         self.timer = self.create_timer(period, self.publish_frame)
         self.get_logger().info(
-            f"Publishing JPEG (software-encoded from YUYV) from {self.video_device} "
-            f"as CompressedImage {self.width}x{self.height}@{self.fps:g}"
+            f"Publishing JPEG (software-encoded via cv2.VideoCapture) from "
+            f"{self.video_device} as CompressedImage {self.width}x{self.height}@{self.fps:g}"
         )
 
-    def _start_stream(self):
-        command = [
-            "v4l2-ctl",
-            f"--device={self.video_device}",
-            f"--set-fmt-video=width={self.width},height={self.height},pixelformat=YUYV",
-            f"--set-parm={int(self.fps)}",
-            "--stream-mmap",
-            "--stream-to=-",
-        ]
-        try:
-            stream = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError("v4l2-ctl is required. Install v4l-utils.") from exc
+    def _open_capture(self):
+        capture = cv2.VideoCapture(self.video_device, cv2.CAP_V4L2)
+        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        capture.set(cv2.CAP_PROP_FPS, self.fps)
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        self._stderr_tail = b""
-        self._stderr_lock = threading.Lock()
-        self._stderr_thread = threading.Thread(
-            target=self._drain_stderr, args=(stream,), daemon=True
-        )
-        self._stderr_thread.start()
+        if not capture.isOpened():
+            raise RuntimeError(f"Failed to open {self.video_device} via cv2.VideoCapture")
 
-        time.sleep(0.1)
-        if stream.poll() is not None:
-            raise RuntimeError(
-                f"v4l2-ctl failed to start color stream: {self._read_stream_error()}"
-            )
-
-        return stream
+        return capture
 
     def publish_frame(self):
-        if self.stream.poll() is not None:
-            self.get_logger().error(
-                f"v4l2-ctl color stream stopped: {self._read_stream_error()}"
-            )
-            self.timer.cancel()
-            return
-
-        frame = self._read_exact_frame()
-        if len(frame) != self.frame_size:
+        ok, bgr = self.capture.read()
+        if not ok or bgr is None:
             self.get_logger().warning("Failed to read color frame", throttle_duration_sec=2.0)
             return
 
-        yuyv = np.frombuffer(frame, dtype=np.uint8).reshape(self.height, self.width, 2)
-        bgr = cv2.cvtColor(yuyv, cv2.COLOR_YUV2BGR_YUYV)
         ok, encoded = cv2.imencode(
             ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
         )
@@ -124,39 +95,9 @@ class V4L2MjpegNode(Node):
         info.width = self.width
         self.info_pub.publish(info)
 
-    def _read_exact_frame(self):
-        chunks = []
-        remaining = self.frame_size
-        while remaining > 0:
-            chunk = self.stream.stdout.read(remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
-    def _drain_stderr(self, stream):
-        while True:
-            chunk = stream.stderr.read(4096)
-            if not chunk:
-                return
-            with self._stderr_lock:
-                self._stderr_tail = (self._stderr_tail + chunk)[-4096:]
-
-    def _read_stream_error(self):
-        with self._stderr_lock:
-            tail = self._stderr_tail
-        if not tail:
-            return "no error output"
-        return tail.decode(errors="replace").strip()
-
     def destroy_node(self):
-        if hasattr(self, "stream") and self.stream.poll() is None:
-            self.stream.terminate()
-            try:
-                self.stream.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                self.stream.kill()
+        if hasattr(self, "capture"):
+            self.capture.release()
         super().destroy_node()
 
 

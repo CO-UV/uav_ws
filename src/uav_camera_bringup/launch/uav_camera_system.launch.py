@@ -18,7 +18,7 @@ def generate_launch_description():
             DeclareLaunchArgument("image_width", default_value="640"),
             DeclareLaunchArgument("image_height", default_value="480"),
             DeclareLaunchArgument("color_fps", default_value="15.0"),
-            DeclareLaunchArgument("depth_fps", default_value="5.0"),
+            DeclareLaunchArgument("depth_fps", default_value="9.0"),
             DeclareLaunchArgument("network_interface", default_value="wlan0"),
             DeclareLaunchArgument("network_ping_host", default_value="8.8.8.8"),
             IncludeLaunchDescription(

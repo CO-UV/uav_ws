@@ -72,6 +72,16 @@ sudo apt install -y \
   python3-colcon-common-extensions
 ```
 
+`v4l2_depth_node`는 Z16 뎁스 프레임을 V4L2 mmap으로 직접 캡처하기 위해
+[linuxpy](https://pypi.org/project/linuxpy/)를 쓴다 (rosdep 키가 없어 apt로는 못 받는다,
+자세한 배경은
+[TROUBLESHOOTING.md §6](src/uav_camera_streamer/uav_camera_streamer/TROUBLESHOOTING.md#6-뎁스-등고선-무늬-재발---소프트웨어-원인-파이프-desync-해결)
+참고):
+
+```bash
+pip3 install --user linuxpy
+```
+
 나중에 RealSense 래퍼 테스트용으로:
 
 ```bash
@@ -381,7 +391,7 @@ journalctl -u uav-camera.service -f
 
 기본 시스템 launch는 이제 Wi-Fi 대역폭을 줄이기 위해 raw `Image` 대신 압축 이미지를
 발행하며, 컬러/뎁스 FPS를 각각 독립적으로 조절할 수 있다 (`color_fps` 기본 15,
-`depth_fps` 기본 5).
+`depth_fps` 기본 9).
 
 - **컬러**: 이 RealSense 컬러 센서의 V4L2 드라이버는 `YUYV`만 노출한다 — 하드웨어
   MJPG 모드가 없다. `v4l2_mjpeg_node`가 raw YUYV를 캡처해서 OpenCV로 소프트웨어
@@ -400,7 +410,26 @@ journalctl -u uav-camera.service -f
   이를 읽어주지 않으면 파이프 버퍼가 가득 차서 약 10~15초 후 스트림이 조용히
   죽어버린다.
 
-**알려진 이슈**: 뎁스 압축 토픽은 안정적으로 동작하지만(크래시 없음), 요청한
-`depth_fps:=5.0`에 비해 실측 발행 속도가 ~1.3Hz밖에 안 된다 — 위의 stderr 수정보다는
-PNG 인코딩 또는 raw 프레임 읽기 자체의 오버헤드가 Pi CPU에서 병목인 것으로 보이나,
-아직 원인을 완전히 특정하지는 못했다.
+## Stage 4: 컬러 색상 깨짐 및 뎁스 fps 병목 수정
+
+- **컬러 색상 깨짐**: `v4l2_mjpeg_node`가 `v4l2-ctl`을 서브프로세스로 띄우고
+  raw stdout 파이프를 고정 크기로 직접 읽던 방식은 프레임 경계 동기화를
+  보장하지 못해서, 스트림 시작 직후나 버퍼 드랍 시점에 한 번이라도 어긋나면
+  그 뒤로 모든 프레임이 초록/자홍 줄무늬로 깨져 보였다 (YUV 채널 순서
+  문제가 아니었다). `cv2.VideoCapture`(OpenCV V4L2 백엔드)로 캡처하도록
+  재작성해서 해결했다 — OpenCV가 프레임 동기화를 내부적으로 처리해준다.
+  자세한 진단 과정은 [TROUBLESHOOTING.md](src/uav_camera_streamer/uav_camera_streamer/TROUBLESHOOTING.md)
+  참고.
+- **뎁스 fps 병목**: `depth_fps:=5.0`을 요청해도 실측 발행 속도가 ~1.1~1.4Hz
+  밖에 안 나오던 문제. 원인은 `publish_raw=false`(기본값)인데도 `v4l2_depth_node`가
+  매 프레임 쓰지도 않는 raw `Image` 메시지를 만들고 있었던 것 — 그중
+  `image.data = frame`(614KB 대입) 한 줄이 이 Pi에서 프레임당 ~555ms 걸렸다.
+  `publish_raw`가 켜져 있을 때만 raw 메시지를 만들도록 고치자 4.97~5.13Hz로
+  정상화됐다. CPU 총량 부족이 아니라 안 쓰는 메시지를 만드는 낭비 코드가
+  진짜 원인이었다 (raw Z16 캡처 자체는 `v4l2-ctl`로 재보면 60fps까지도 나옴).
+  이어서 읽기/인코딩/발행을 스레드로 분리한 파이프라인 구조로 바꿔서
+  (`v4l2_depth_node`) read 대기 시간만큼 더 절약했지만, `cv2.imencode`와 달리
+  `rclpy`의 `publish()`는 GIL을 오래 붙들고 있어서 인코딩과 발행이 진짜
+  병렬로 겹치지는 않았다 — 그래서 기대했던 15~18Hz가 아니라 **~9Hz**까지만
+  올라갔다. 기본값을 `depth_fps:=9.0`으로 설정. 더 올리려면 해상도를
+  낮추거나(예: 424x240) 멀티프로세싱으로 GIL을 우회해야 한다.
